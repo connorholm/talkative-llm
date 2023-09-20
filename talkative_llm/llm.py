@@ -22,11 +22,9 @@ from tenacity import (
     stop_after_attempt,
     wait_random_exponential,
 )  # for exponential backoff
-n=100
+n=5
 
-COHERE_API_KEY = os.environ.get("COHERE_API_KEY")
-OPENAI_API_KEY = "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"
-OPENAI_ORGANIZATION_ID = "org-lNpaA0zJC91AW82K1JMyGjct"
+
 
 console = Console()
 error_console = Console(stderr=True, style='bold red')
@@ -129,21 +127,22 @@ class HuggingFaceCaller(LLMCaller):
                 console.log('Following config parameters are ignored, please check:')
                 console.log(unused_kwargs)
         except OSError:
-            error_console.log(f'`generation_config.json` could not be found at https://huggingface.co/{model_name}')
+            # error_console.log(f'`generation_config.json` could not be found at https://huggingface.co/{model_name}')
             # TODO: Need to check if just passing self.caller_params are ok for the generate method.
             self.generation_config = GenerationConfig(**self.caller_params)
 
         if 'device_map' in model_params:
             self.model = model_type.from_pretrained(model_name, **model_params)
         else:
-            self.model = model_type.from_pretrained(model_name, **model_params).to(self.device)
+            self.model = model_type.from_pretrained(model_name, **model_params, torch_dtype=torch.bfloat16).to(self.device)
+            
         self.model.eval()
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, **tokenizer_params)
 
         # console.log(f'Loaded parameters are:')
         # console.log(self.generation_config)
 
-    @retry(wait=wait_random_exponential(min=1, max=60), stop=stop_after_attempt(n))
+    # @retry(wait=wait_random_exponential(min=1, max=60), stop=stop_after_attempt(n))
     def generate(self, inputs): # List[str] | List[Dict]) -> List[Dict]:
         tokenized_inputs = self.tokenizer(inputs, return_tensors='pt')
         tokenized_inputs = tokenized_inputs.to(self.device)
@@ -153,15 +152,15 @@ class HuggingFaceCaller(LLMCaller):
         for key in unused_args:
             del tokenized_inputs[key]
 
+        self.model.tie_weights()
         with torch.no_grad():
-            outputs = self.model.generate(**tokenized_inputs, generation_config=self.generation_config, do_sample=True, temperature=1.0)
+            outputs = self.model.generate(**tokenized_inputs, generation_config=self.generation_config, pad_token_id=self.tokenizer.eos_token_id, do_sample=False, temperature=0.0, repetition_penalty=1.2)
         decoded_outputs = self.tokenizer.batch_decode(outputs, skip_special_tokens=self.skip_special_tokens)
         all_results = []
         for decoded_output in decoded_outputs:
             result = {'generation': decoded_output}
             all_results.append(result)
         return all_results
-
 
 class MPTCaller(LLMCaller):
     def __init__(self, config: Dict) -> None:
@@ -188,6 +187,7 @@ class MPTCaller(LLMCaller):
             torch_dtype=torch.bfloat16,
             trust_remote_code=True
         )
+        self.model.tie_weights()
         self.model.to(self.device)
         self.tokenizer = AutoTokenizer.from_pretrained('EleutherAI/gpt-neox-20b')
         self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -196,7 +196,7 @@ class MPTCaller(LLMCaller):
         # console.log(f'Loaded parameters are:')
         # console.log(self.generation_config)
 
-    @retry(wait=wait_random_exponential(min=1, max=60), stop=stop_after_attempt(n))
+    # @retry(wait=wait_random_exponential(min=1, max=60), stop=stop_after_attempt(n))
     def generate(self, inputs): # List[str] | List[Dict]) -> List[Dict]:
         tokenized_inputs = self.tokenizer(inputs, return_tensors='pt', padding=True, truncation=True)
         tokenized_inputs = tokenized_inputs.to(self.device)
@@ -206,7 +206,7 @@ class MPTCaller(LLMCaller):
         for key in unused_args:
             del tokenized_inputs[key]
 
-        outputs = self.model.generate(**tokenized_inputs)
+        outputs = self.model.generate(**tokenized_inputs, max_new_tokens=128, early_stopping=True, num_beams=3, top_p=1.0, top_k=50, num_return_sequences=1, do_sample=False, temperature=0.0, repetition_penalty=1.2)
         decoded_outputs = self.tokenizer.batch_decode(outputs, skip_special_tokens=self.skip_special_tokens)
         all_results = []
         for decoded_output in decoded_outputs:
@@ -226,7 +226,7 @@ class AlpacaLoraCaller(LLMCaller):
     def __init__(self, config: Dict) -> None:
         super().__init__()
         assert config['framework'] == 'alpaca-lora'
-        assert config['device'] in ['cpu', 'cuda']
+        # assert config['device'] in ['cpu', 'cuda']
         self.device = config['device']
         if self.device == 'cuda':
             assert torch.cuda.is_available(), 'cuda is not available'
@@ -250,7 +250,7 @@ class AlpacaLoraCaller(LLMCaller):
             self.generation_config = GenerationConfig(**self.caller_params)
 
         # Call a model depending on using gpu
-        if self.device == 'cuda':
+        if "cuda" in self.device:
             model = model_type.from_pretrained(model_name, load_in_8bit=self.load_8bit, torch_dtype=torch.float16, device_map={'': 0})
             self.model = PeftModel.from_pretrained(model, self.lora_weights, torch_dtype=torch.float16, device_map={'': 0})
         else:
@@ -272,12 +272,12 @@ class AlpacaLoraCaller(LLMCaller):
         # console.log(f'API parameters are:')
         # console.log(self.generation_config)
 
-    @retry(wait=wait_random_exponential(min=1, max=60), stop=stop_after_attempt(n))
+    # @retry(wait=wait_random_exponential(min=1, max=60), stop=stop_after_attempt(n))
     def generate(self, inputs): # List[str] | List[Dict]) -> List[Dict] | Dict:
         tokenized_inputs = self.tokenizer(inputs, return_tensors='pt')
         tokenized_input_ids = tokenized_inputs['input_ids'].to(self.device)
         with torch.no_grad():
-            outputs = self.model.generate(input_ids=tokenized_input_ids, generation_config=self.generation_config, do_sample=True, temperature=0.7)
+            outputs = self.model.generate(input_ids=tokenized_input_ids, generation_config=self.generation_config, do_sample=False, temperature=0.0, repetition_penalty=1.2)
         decoded_outputs = self.tokenizer.batch_decode(outputs, skip_special_tokens=self.skip_special_tokens)
         all_results = []
         for decoded_output in decoded_outputs:
@@ -294,19 +294,23 @@ class CohereCaller(LLMCaller):
         self.caller = cohere.Client(self.api_key)
         self.caller_params = config['params']
 
-        console.log(f'API parameters are:')
-        console.log(self.caller_params)
+        # console.log(f'API parameters are:')
+        # console.log(self.caller_params)
 
-    @retry(wait=wait_random_exponential(min=1, max=60), stop=stop_after_attempt(n))
+    # @retry(wait=wait_random_exponential(min=15, max=60), stop=stop_after_attempt(n))
     def generate(self, inputs): # List[str]) -> List[Dict]:
         assert isinstance(inputs, list) and isinstance(inputs[0], str)
 
-        responses = self.caller.batch_generate(prompts=inputs, **self.caller_params)
         all_results = []
-        for response in responses:
-            for generation in response.generations:
-                result = {'generation': generation.text}
-                all_results.append(result)
+        try:
+            responses = self.caller.batch_generate(prompts=inputs, **self.caller_params)
+            for response in responses:
+                for generation in response.generations:
+                    result = {'generation': generation.text}
+                    all_results.append(result)
+        except:
+            all_results = [{'generation': 'Invalid Response'}]            
+        
         return all_results
 
 
