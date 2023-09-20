@@ -24,8 +24,6 @@ from tenacity import (
 )  # for exponential backoff
 n=5
 
-
-
 console = Console()
 error_console = Console(stderr=True, style='bold red')
 
